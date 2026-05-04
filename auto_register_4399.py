@@ -156,7 +156,7 @@ class ProxyManager:
             self._raw.extend(file_proxies)
             log.info(f'从文件加载 {len(file_proxies)} 个代理')
         self.fetch_from_list()
-        self._start_checker()
+        self._start_checkers()
 
     def fetch_from_list(self):
         urls = [u.strip() for u in CONFIG['proxy_list_urls'].split(',') if u.strip()]
@@ -179,7 +179,6 @@ class ProxyManager:
         log.info(f'本次拉取 {total_added} 个代理, 待验证队列 {len(self._raw)} 个')
 
     def _check_one(self, proxy):
-        """验证单个代理是否可用"""
         proxies = {'http': f'http://{proxy}', 'https': f'http://{proxy}'}
         try:
             r = requests.get(CONFIG['proxy_check_url'],
@@ -189,64 +188,67 @@ class ProxyManager:
             return False
 
     def _checker_worker(self):
-        """验证线程：从 _raw 取代理，验证后放入 _ready 或 _bad"""
+        """后台验证线程：持续从 _raw 取代理验证，放入 _ready 或 _bad"""
         while not self._stop_event.is_set():
+            proxy = None
             with self._lock:
-                if not self._raw:
-                    return
-                proxy = self._raw.pop(0)
+                if self._raw:
+                    proxy = self._raw.pop(0)
+            if proxy is None:
+                time.sleep(0.5)
+                continue
             if self._check_one(proxy):
                 with self._lock:
                     if proxy not in self._bad:
                         self._ready.append(proxy)
+                        log.debug(f'代理可用: {proxy} (就绪 {len(self._ready)})')
             else:
                 with self._lock:
                     self._bad.add(proxy)
 
-    def _start_checker(self):
-        """启动多线程批量验证"""
+    def _start_checkers(self):
+        """启动后台验证线程（守护线程，边验证边注册）"""
         if not self._raw:
             return
-        log.info(f'启动 {self._check_threads} 线程验证 {len(self._raw)} 个代理...')
-        with ThreadPoolExecutor(max_workers=self._check_threads) as pool:
-            list(pool.map(lambda p: self._checker_worker(), range(min(self._check_threads, len(self._raw)))))
-        log.info(f'验证完成: 可用 {len(self._ready)}, 失效 {len(self._bad)}')
+        n = min(self._check_threads, len(self._raw))
+        log.info(f'启动 {n} 个后台验证线程, {len(self._raw)} 个代理待验证 (边验证边注册)')
+        for _ in range(n):
+            t = threading.Thread(target=self._checker_worker, daemon=True)
+            t.start()
 
     def _refill(self):
-        """补充代理池：拉取新代理并验证"""
+        """补充代理池：拉取新代理并启动更多验证线程"""
+        before = len(self._raw)
         self.fetch_from_list()
-        if self._raw:
-            log.info(f'补充验证 {len(self._raw)} 个代理...')
-            with ThreadPoolExecutor(max_workers=self._check_threads) as pool:
-                list(pool.map(lambda p: self._checker_worker(), range(min(self._check_threads, len(self._raw)))))
-            log.info(f'补充完成: 可用 {len(self._ready)}, 失效 {len(self._bad)}')
+        added = len(self._raw) - before
+        if added > 0:
+            n = min(self._check_threads, added)
+            log.info(f'补充启动 {n} 个验证线程')
+            for _ in range(n):
+                t = threading.Thread(target=self._checker_worker, daemon=True)
+                t.start()
 
     def acquire(self):
-        """获取一个独占代理（每个线程不同IP）"""
+        """获取一个独占代理（每个线程不同IP），边验证边获取"""
         with self._lock:
             if not CONFIG['use_proxy']:
                 if self._direct_count >= CONFIG['max_per_ip']:
                     log.warning(f'直连IP已达上限 {CONFIG["max_per_ip"]}, 需要开启代理')
                     return None
                 return {}
-            # 从 ready 池取一个未超限的
-            for i, proxy in enumerate(self._ready):
-                if self._usage.get(proxy, 0) < CONFIG['max_per_ip']:
-                    self._ready.pop(i)
-                    self._in_use[proxy] = self._usage.get(proxy, 0)
-                    return {'http': f'http://{proxy}', 'https': f'http://{proxy}',
-                            '_proxy': proxy}
-            # ready 池空了，尝试补充
-            pass
-        # 锁外补充
-        self._refill()
-        with self._lock:
-            for i, proxy in enumerate(self._ready):
-                if self._usage.get(proxy, 0) < CONFIG['max_per_ip']:
-                    self._ready.pop(i)
-                    self._in_use[proxy] = self._usage.get(proxy, 0)
-                    return {'http': f'http://{proxy}', 'https': f'http://{proxy}',
-                            '_proxy': proxy}
+
+        # 轮询等待就绪代理（验证线程在后台持续产出）
+        for _ in range(30):  # 最多等15秒
+            with self._lock:
+                for i, proxy in enumerate(self._ready):
+                    if self._usage.get(proxy, 0) < CONFIG['max_per_ip']:
+                        self._ready.pop(i)
+                        self._in_use[proxy] = self._usage.get(proxy, 0)
+                        return {'http': f'http://{proxy}', 'https': f'http://{proxy}',
+                                '_proxy': proxy}
+            # ready 池空，触发补充
+            self._refill()
+            time.sleep(0.5)
         return {}
 
     def release(self, proxies, success=False):
