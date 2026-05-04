@@ -55,6 +55,22 @@ on:
         description: '注册后自动登录获取sauth (true/false)'
         required: false
         default: 'true'
+      proxy_api_url:
+        description: '代理API地址'
+        required: false
+        default: 'https://proxy.scdn.io/api/get_proxy.php'
+      proxy_api_protocol:
+        description: '代理API协议 (http/https/socks4/socks5/all)'
+        required: false
+        default: 'http'
+      proxy_api_count:
+        description: '每次从API获取代理数量 (1-20)'
+        required: false
+        default: '20'
+      max_per_ip:
+        description: '单IP最大注册数(超限自动换IP)'
+        required: false
+        default: '15'
 
   schedule:
     - cron: '0 */6 * * *'
@@ -116,6 +132,10 @@ jobs:
           MIN_INTERVAL: ${{ github.event.inputs.min_interval || '1' }}
           MAX_INTERVAL: ${{ github.event.inputs.max_interval || '3' }}
           AUTO_LOGIN: ${{ github.event.inputs.auto_login || 'true' }}
+          PROXY_API_URL: ${{ github.event.inputs.proxy_api_url || 'https://proxy.scdn.io/api/get_proxy.php' }}
+          PROXY_API_PROTOCOL: ${{ github.event.inputs.proxy_api_protocol || 'http' }}
+          PROXY_API_COUNT: ${{ github.event.inputs.proxy_api_count || '20' }}
+          MAX_PER_IP: ${{ github.event.inputs.max_per_ip || '15' }}
         run: |
           COUNT="${{ github.event.inputs.count || '0' }}"
           DURATION="${{ github.event.inputs.duration || '3600' }}"

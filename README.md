@@ -4,13 +4,18 @@
 
 如果失效可以直接在issues里反馈。
 
+> **重要：单个IP最多只能注册15个账号，超过会被封。** 工具会自动计数并切换代理IP，务必开启代理使用。
+
+**官方QQ群：796507563**
+
 ## 功能
 
 - 自动识别验证码（自定义CNN模型 / ddddocr）
 - 自动实名认证
 - 多线程并发注册
 - 注册成功后自动登录，获取Sauth凭证
-- 支持代理IP
+- 支持代理IP（本地文件 / 在线API自动获取）
+- 单IP注册数限制，超限自动换IP，防止封号
 - 支持GitHub Actions云端运行，所有参数可视化配置
 - 支持按注册数量或运行时长自动停止
 
@@ -73,6 +78,9 @@ base64 -w 0 sfz.txt
 | use_custom_model | 使用自定义验证码模型 | true |
 | auto_login | 注册后自动登录获取Sauth | true |
 | use_proxy | 使用代理IP | false |
+| proxy_api_protocol | 代理API协议 (http/https/socks4/socks5/all) | http |
+| proxy_api_count | 每次从API获取代理数量 (1-20) | 20 |
+| max_per_ip | 单IP最大注册数(超限自动换IP) | 15 |
 | max_captcha_retry | 验证码最大重试次数 | 3 |
 | min_interval | 每轮最小间隔(秒) | 1 |
 | max_interval | 每轮最大间隔(秒) | 3 |
@@ -118,6 +126,10 @@ USE_PROXY=true WORKERS=5 python auto_register_4399.py --count 20
 |---|---|
 | USE_PROXY | 是否使用代理 |
 | PROXY_FILE | 代理IP文件路径 |
+| PROXY_API_URL | 代理API地址 |
+| PROXY_API_PROTOCOL | 代理API协议类型 |
+| PROXY_API_COUNT | 每次从API获取代理数量 |
+| MAX_PER_IP | 单IP最大注册数 |
 | USE_CUSTOM_MODEL | 是否使用自定义模型 |
 | CUSTOM_MODEL_FILE | 模型文件路径 |
 | MAX_CAPTCHA_RETRY | 验证码重试次数 |
@@ -135,6 +147,23 @@ USE_PROXY=true WORKERS=5 python auto_register_4399.py --count 20
 | WORKERS | 并发线程数 |
 | MIN_INTERVAL | 最小间隔 |
 | MAX_INTERVAL | 最大间隔 |
+
+## 代理说明
+
+> **单IP最多注册15个账号，超限会被封。** 必须开启代理使用本工具。
+
+开启代理后（`use_proxy=true`），按以下优先级获取代理：
+
+1. **本地文件**：优先读取 `IP.txt`（每行 `ip:port`）
+2. **在线API**：文件为空时自动从 [proxy.scdn.io](https://proxy.scdn.io/api_docs.php) 获取免费代理
+
+代理管理逻辑：
+- 每个代理IP最多注册 `max_per_ip`（默认15）个账号
+- 达到上限后**自动切换**下一个代理
+- 遇到封禁/超频错误**立即丢弃**当前代理
+- 代理池耗尽后**自动从API拉取**新代理
+- 每轮结束后打印代理池状态（总数/可用/失效）
+- 不开代理时，直连IP同样受15次限制
 
 ## 数据文件格式
 
