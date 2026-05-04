@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 register.log
 used_sfz.txt
+sauth.json
 captchas/
 captchas_labeled/
 captcha_labels.json

@@ -3,10 +3,59 @@ name: 4399 Auto Register
 on:
   workflow_dispatch:
     inputs:
+      count:
+        description: '成功注册数量 (0=不限, 按 duration 停)'
+        required: false
+        default: '0'
       duration:
-        description: '运行时长(秒), 0=无限(最长6小时)'
+        description: '最大运行时长(秒), 0=无限(最长6小时)'
         required: false
         default: '3600'
+      workers:
+        description: '并发线程数'
+        required: false
+        default: '3'
+      max_sfz_uses:
+        description: '每个身份证最大使用次数'
+        required: false
+        default: '4'
+      username_prefix:
+        description: '用户名前缀 (留空=纯随机)'
+        required: false
+        default: ''
+      username_len:
+        description: '用户名总长度'
+        required: false
+        default: '7'
+      password_len:
+        description: '密码长度'
+        required: false
+        default: '10'
+      use_custom_model:
+        description: '使用自定义验证码模型 (true/false)'
+        required: false
+        default: 'true'
+      use_proxy:
+        description: '使用代理 (true/false)'
+        required: false
+        default: 'false'
+      max_captcha_retry:
+        description: '验证码最大重试次数'
+        required: false
+        default: '3'
+      min_interval:
+        description: '每轮最小间隔(秒)'
+        required: false
+        default: '1'
+      max_interval:
+        description: '每轮最大间隔(秒)'
+        required: false
+        default: '3'
+      auto_login:
+        description: '注册后自动登录获取sauth (true/false)'
+        required: false
+        default: 'true'
+
   schedule:
     - cron: '0 */6 * * *'
 
@@ -14,6 +63,8 @@ jobs:
   register:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
     steps:
       - name: Checkout
@@ -36,6 +87,7 @@ jobs:
           path: |
             4399.txt
             used_sfz.txt
+            sauth.json
           key: register-data-${{ github.ref }}
           restore-keys: |
             register-data-
@@ -52,9 +104,22 @@ jobs:
           fi
 
       - name: Run register script
+        env:
+          WORKERS: ${{ github.event.inputs.workers || '3' }}
+          MAX_SFZ_USES: ${{ github.event.inputs.max_sfz_uses || '4' }}
+          USERNAME_PREFIX: ${{ github.event.inputs.username_prefix || '' }}
+          USERNAME_LEN: ${{ github.event.inputs.username_len || '7' }}
+          PASSWORD_LEN: ${{ github.event.inputs.password_len || '10' }}
+          USE_CUSTOM_MODEL: ${{ github.event.inputs.use_custom_model || 'true' }}
+          USE_PROXY: ${{ github.event.inputs.use_proxy || 'false' }}
+          MAX_CAPTCHA_RETRY: ${{ github.event.inputs.max_captcha_retry || '3' }}
+          MIN_INTERVAL: ${{ github.event.inputs.min_interval || '1' }}
+          MAX_INTERVAL: ${{ github.event.inputs.max_interval || '3' }}
+          AUTO_LOGIN: ${{ github.event.inputs.auto_login || 'true' }}
         run: |
+          COUNT="${{ github.event.inputs.count || '0' }}"
           DURATION="${{ github.event.inputs.duration || '3600' }}"
-          python auto_register_4399.py --duration "$DURATION"
+          python auto_register_4399.py --count "$COUNT" --duration "$DURATION"
         continue-on-error: true
 
       - name: Upload results
@@ -64,5 +129,6 @@ jobs:
           path: |
             4399.txt
             used_sfz.txt
+            sauth.json
             register.log
           retention-days: 30

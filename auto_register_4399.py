@@ -1,3 +1,4 @@
+import os
 import time
 import logging
 import requests
@@ -11,23 +12,36 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ==================== 配置 ====================
+
+def env(key, default):
+    v = os.environ.get(key)
+    if v is None or v == '':
+        return default
+    t = type(default)
+    if t is bool:
+        return v.lower() in ('1', 'true', 'yes')
+    if t is int:
+        return int(v)
+    return v
+
+
+# ==================== 配置 (支持环境变量覆盖) ====================
 CONFIG = {
     # 代理
-    'use_proxy': False,
-    'proxy_file': 'IP.txt',
+    'use_proxy':        env('USE_PROXY', False),
+    'proxy_file':       env('PROXY_FILE', 'IP.txt'),
 
     # 验证码识别
-    'use_custom_model': True,  # True=用训练的模型, False=用ddddocr
-    'custom_model_file': 'captcha_model.pth',
+    'use_custom_model': env('USE_CUSTOM_MODEL', True),
+    'custom_model_file': env('CUSTOM_MODEL_FILE', 'captcha_model.pth'),
 
     # 注册
-    'max_captcha_retry': 3,
-    'max_sfz_uses': 4,
-    'captcha_length': 4,
-    'username_prefix': '',   # 用户名前缀，如 'usr_'；留空则纯随机
-    'username_len': 7,       # 用户名总长度（含前缀）
-    'password_len': 10,
+    'max_captcha_retry': env('MAX_CAPTCHA_RETRY', 3),
+    'max_sfz_uses':     env('MAX_SFZ_USES', 4),
+    'captcha_length':   env('CAPTCHA_LENGTH', 4),
+    'username_prefix':  env('USERNAME_PREFIX', ''),
+    'username_len':     env('USERNAME_LEN', 7),
+    'password_len':     env('PASSWORD_LEN', 10),
 
     # 请求
     'captcha_url': 'https://ptlogin.4399.com/ptlogin/captcha.do?captchaId={}',
@@ -37,16 +51,20 @@ CONFIG = {
         'Referer': 'https://ptlogin.4399.com/',
     },
 
+    # 登录获取 sauth
+    'auto_login':   env('AUTO_LOGIN', True),
+
     # 文件
-    'sfz_file': 'sfz.txt',
-    'used_sfz_file': 'used_sfz.txt',
-    'output_file': '4399.txt',
-    'log_file': 'register.log',
+    'sfz_file':      env('SFZ_FILE', 'sfz.txt'),
+    'used_sfz_file': env('USED_SFZ_FILE', 'used_sfz.txt'),
+    'output_file':   env('OUTPUT_FILE', '4399.txt'),
+    'sauth_file':    env('SAUTH_FILE', 'sauth.json'),
+    'log_file':      env('LOG_FILE', 'register.log'),
 
     # 并发
-    'workers': 3,           # 并发线程数（别太大，容易被封）
-    'min_interval': 1,
-    'max_interval': 3,
+    'workers':      env('WORKERS', 3),
+    'min_interval': env('MIN_INTERVAL', 1),
+    'max_interval': env('MAX_INTERVAL', 3),
 }
 
 ALPHABET = 'abcdefghijklmnopqrstuvwxyz1234567890'
@@ -83,6 +101,10 @@ if CONFIG['use_custom_model']:
 else:
     ocr_engine = ddddocr.DdddOcr(show_ad=False)
     log.info('使用 ddddocr')
+
+if CONFIG['auto_login']:
+    from login_4399 import do_login
+    log.info('自动登录已启用')
 
 
 def load_lines(file):
@@ -207,6 +229,8 @@ def pick_sfz(valid_sfz, used_count):
 
 
 file_lock = threading.Lock()
+success_counter = 0
+success_lock = threading.Lock()
 
 
 def register_4399(username, password, valid_sfz, used_count, proxy_manager, session=None):
@@ -268,7 +292,30 @@ def register_4399(username, password, valid_sfz, used_count, proxy_manager, sess
                     fh.write(f'{username}----{password}\n')
                 with open(CONFIG['used_sfz_file'], 'a', encoding='utf-8') as fh2:
                     fh2.write(f'{sfz_line}----{count}\n')
-            log.info(f'[+] 注册成功 {username}----{password} (sfz {count}/{CONFIG["max_sfz_uses"]})')
+            with success_lock:
+                global success_counter
+                success_counter += 1
+                cur = success_counter
+            log.info(f'[+] 注册成功 {username}----{password} (sfz {count}/{CONFIG["max_sfz_uses"]}) (总成功: {cur})')
+
+            if CONFIG['auto_login']:
+                try:
+                    sauth = do_login(username, password, proxies, CONFIG['headers'],
+                                     ocr_engine, CONFIG['use_custom_model'])
+                    if sauth:
+                        with file_lock:
+                            import json as _json
+                            with open(CONFIG['sauth_file'], 'a', encoding='utf-8') as sf:
+                                sf.write(_json.dumps({
+                                    'username': username, 'password': password,
+                                    'sauth': sauth
+                                }, ensure_ascii=False) + '\n')
+                        log.info(f'[+] 登录成功 {username} -> sauth 已保存')
+                    else:
+                        log.warning(f'[!] 登录失败 {username}')
+                except Exception as e:
+                    log.warning(f'[!] 登录异常 {username}: {e}')
+
             return 'success'
         elif code == 'captcha_wrong':
             continue
@@ -303,6 +350,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--duration', type=int, default=0, help='运行时长(秒), 0=无限')
+    parser.add_argument('--count', type=int, default=0, help='成功注册数量, 0=不限')
     args = parser.parse_args()
 
     proxy_manager = ProxyManager()
@@ -320,6 +368,10 @@ if __name__ == "__main__":
     valid_sfz = load_valid_sfz()
     available = sum(1 for item in valid_sfz if used_count.get(item[0], 0) < CONFIG['max_sfz_uses'])
     log.info(f'已加载 {len(valid_sfz)} 条有效身份证, 可用 {available} 条, 并发 {CONFIG["workers"]} 线程')
+    if args.count > 0:
+        log.info(f'目标: 注册 {args.count} 个账号')
+    if args.duration > 0:
+        log.info(f'限时: {args.duration} 秒')
 
     deadline = time.time() + args.duration if args.duration > 0 else None
 
@@ -328,6 +380,10 @@ if __name__ == "__main__":
             while True:
                 if deadline and time.time() >= deadline:
                     log.info(f'已达到运行时长 {args.duration} 秒, 停止')
+                    break
+
+                if args.count > 0 and success_counter >= args.count:
+                    log.info(f'已达到目标数量 {args.count} 个, 停止')
                     break
 
                 futures = []
@@ -344,3 +400,5 @@ if __name__ == "__main__":
                 time.sleep(random.uniform(CONFIG['min_interval'], CONFIG['max_interval']))
         except KeyboardInterrupt:
             log.info('已停止')
+
+    log.info(f'本次运行结束, 总成功注册: {success_counter} 个')
