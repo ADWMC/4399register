@@ -35,7 +35,8 @@ CONFIG = {
         'https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt,'
         'https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/http.txt,'
         'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt,'
-        'https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt'
+        'https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt,'
+        'https://raw.githubusercontent.com/ABoredCat/Free-Proxy/main/proxies/http.txt'
     ),
     'max_per_ip':         env('MAX_PER_IP', 15),
     'proxy_check_threads': env('PROXY_CHECK_THREADS', 50),
@@ -73,8 +74,8 @@ CONFIG = {
     'log_file':      env('LOG_FILE', 'register.log'),
 
     # 并发
-    'workers':      env('WORKERS', 3),
-    'min_interval': env('MIN_INTERVAL', 1),
+    'workers':      env('WORKERS', 150),
+    'min_interval': env('MIN_INTERVAL', 2),
     'max_interval': env('MAX_INTERVAL', 3),
 }
 
@@ -145,6 +146,7 @@ class ProxyManager:
         self._in_use = {}         # {proxy: 使用次数} 当前被线程占用的代理
         self._bad = set()         # 失效代理
         self._usage = {}          # {proxy: 累计注册成功次数}
+        self._fail_count = {}     # {proxy: 连续失败次数}
         self._direct_count = 0    # 直连IP计数
         self._raw = []            # 待验证的原始代理
         self._check_threads = CONFIG['proxy_check_threads']
@@ -197,14 +199,16 @@ class ProxyManager:
             if proxy is None:
                 time.sleep(0.5)
                 continue
-            if self._check_one(proxy):
-                with self._lock:
-                    if proxy not in self._bad:
-                        self._ready.append(proxy)
-                        log.debug(f'代理可用: {proxy} (就绪 {len(self._ready)})')
-            else:
-                with self._lock:
+            ok = self._check_one(proxy)
+            with self._lock:
+                if ok and proxy not in self._bad:
+                    self._ready.append(proxy)
+                else:
                     self._bad.add(proxy)
+                # 每验证50个打印一次进度
+                total_checked = len(self._ready) + len(self._bad)
+                if total_checked % 50 == 0:
+                    log.info(f'验证进度: 已检查 {total_checked}, 就绪 {len(self._ready)}, 失效 {len(self._bad)}')
 
     def _start_checkers(self):
         """启动后台验证线程（守护线程，边验证边注册）"""
@@ -217,7 +221,7 @@ class ProxyManager:
             t.start()
 
     def _refill(self):
-        """补充代理池：拉取新代理并启动更多验证线程"""
+        """补充代理池"""
         before = len(self._raw)
         self.fetch_from_list()
         added = len(self._raw) - before
@@ -238,17 +242,26 @@ class ProxyManager:
                 return {}
 
         # 轮询等待就绪代理（验证线程在后台持续产出）
-        for _ in range(30):  # 最多等15秒
+        for i in range(60):  # 最多等30秒
             with self._lock:
-                for i, proxy in enumerate(self._ready):
+                for j, proxy in enumerate(self._ready):
                     if self._usage.get(proxy, 0) < CONFIG['max_per_ip']:
-                        self._ready.pop(i)
+                        self._ready.pop(j)
                         self._in_use[proxy] = self._usage.get(proxy, 0)
                         return {'http': f'http://{proxy}', 'https': f'http://{proxy}',
                                 '_proxy': proxy}
-            # ready 池空，触发补充
-            self._refill()
+                raw_left = len(self._raw)
+                ready_cnt = len(self._ready)
+                bad_cnt = len(self._bad)
+            # 每5秒打印一次等待状态
+            if i > 0 and i % 10 == 0:
+                log.info(f'等待可用代理... 就绪{ready_cnt} 待验证{raw_left} 失效{bad_cnt}')
+            # ready 池空且没有待验证的了，触发补充
+            if raw_left == 0 and ready_cnt == 0:
+                self._refill()
             time.sleep(0.5)
+        with self._lock:
+            log.warning(f'等待超时, 就绪{len(self._ready)} 失效{len(self._bad)}, 无可用代理')
         return {}
 
     def release(self, proxies, success=False):
@@ -263,21 +276,38 @@ class ProxyManager:
             self._in_use.pop(proxy, None)
             if success:
                 self._usage[proxy] = self._usage.get(proxy, 0) + 1
-                # 如果还没超限，放回 ready 池复用
+                self._fail_count.pop(proxy, None)  # 成功清零失败计数
                 if self._usage[proxy] < CONFIG['max_per_ip']:
                     self._ready.append(proxy)
             else:
-                # 失败也放回，下次重试（可能临时故障）
                 self._ready.append(proxy)
 
+    def soft_fail(self, proxies):
+        """网络错误，不直接丢弃，放回池里重试，连续10次才丢"""
+        if not proxies or '_proxy' not in proxies:
+            return
+        proxy = proxies['_proxy']
+        with self._lock:
+            self._in_use.pop(proxy, None)
+            cnt = self._fail_count.get(proxy, 0) + 1
+            self._fail_count[proxy] = cnt
+            if cnt >= 10:
+                self._bad.add(proxy)
+                self._fail_count.pop(proxy, None)
+                log.warning(f'代理连续失败{cnt}次, 丢弃: {proxy}')
+            else:
+                self._ready.append(proxy)
+                log.info(f'代理网络错误({cnt}/10), 放回重试: {proxy}')
+
     def mark_bad(self, proxies):
-        """标记代理失效"""
+        """代理被封/被限频，直接丢弃"""
         if not proxies or '_proxy' not in proxies:
             return
         proxy = proxies['_proxy']
         with self._lock:
             self._in_use.pop(proxy, None)
             self._bad.add(proxy)
+            self._fail_count.pop(proxy, None)
             log.warning(f'代理失效: {proxy} (已注册 {self._usage.get(proxy, 0)} 次)')
 
     def stats(self):
@@ -285,7 +315,8 @@ class ProxyManager:
             ready = len(self._ready)
             busy = len(self._in_use)
             bad = len(self._bad)
-            return f'代理池: 就绪{ready} 使用中{busy} 失效{bad}'
+            raw = len(self._raw)
+            return f'代理池: 就绪{ready} 使用中{busy} 待验证{raw} 失效{bad}'
 
 
 # ==================== 验证码 ====================
@@ -356,21 +387,11 @@ def pick_sfz(valid_sfz, used_count):
 file_lock = threading.Lock()
 success_counter = 0
 success_lock = threading.Lock()
+registered_accounts = []  # 本次注册成功的账号 [(username, password), ...]
 
 
-def register_4399(username, password, valid_sfz, used_count, proxy_manager):
-    proxies = proxy_manager.acquire()
-    if proxies is None:
-        return 'ip_limit'
-    if not proxies:
-        return 'no_proxy'
-
-    with file_lock:
-        sfz_line, realname, idcard = pick_sfz(valid_sfz, used_count)
-    if not sfz_line:
-        proxy_manager.release(proxies)
-        return 'no_sfz'
-
+def _try_register_once(username, password, realname, idcard, proxies, proxy_manager):
+    """用一个代理尝试注册（含验证码重试），返回 (结果, 需要换代理)"""
     for attempt in range(CONFIG['max_captcha_retry'] + 1):
         sessionId = 'captchaReq' + ''.join(random.sample(ALPHABET, 19))
         try:
@@ -381,8 +402,8 @@ def register_4399(username, password, valid_sfz, used_count, proxy_manager):
                 requests.exceptions.SSLError,
                 requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout):
-            proxy_manager.mark_bad(proxies)
-            return 'net_error'
+            proxy_manager.soft_fail(proxies)
+            return 'net_error', True  # 换代理
         yzm_data = recognize_captcha(captcha_img)
         if yzm_data is None:
             continue
@@ -409,11 +430,44 @@ def register_4399(username, password, valid_sfz, used_count, proxy_manager):
                 requests.exceptions.SSLError,
                 requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout):
-            proxy_manager.mark_bad(proxies)
-            return 'net_error'
+            proxy_manager.soft_fail(proxies)
+            return 'net_error', True  # 换代理
 
         code = match_error(html)
         if code == 'success':
+            return 'success', False
+        elif code == 'captcha_wrong':
+            continue
+        elif code in ('server_503', 'server_busy', 'rate_limit'):
+            proxy_manager.mark_bad(proxies)
+            return code, True  # 换代理
+        elif code:
+            return code, False
+        else:
+            return 'unknown', False
+
+    return 'captcha_exhausted', True  # 验证码全错，可能代理有问题
+
+
+def register_4399(username, password, valid_sfz, used_count, proxy_manager):
+    """注册一个账号，网络失败自动换代理重试"""
+    with file_lock:
+        sfz_line, realname, idcard = pick_sfz(valid_sfz, used_count)
+    if not sfz_line:
+        return 'no_sfz'
+
+    max_proxy_tries = 3  # 最多换3个代理
+    for proxy_try in range(max_proxy_tries):
+        proxies = proxy_manager.acquire()
+        if proxies is None:
+            return 'ip_limit'
+        if not proxies:
+            return 'no_proxy'
+
+        result, need_switch = _try_register_once(
+            username, password, realname, idcard, proxies, proxy_manager)
+
+        if result == 'success':
             proxy_manager.release(proxies, success=True)
             with file_lock:
                 count = used_count.get(sfz_line, 0) + 1
@@ -422,45 +476,23 @@ def register_4399(username, password, valid_sfz, used_count, proxy_manager):
                     fh.write(f'{username}----{password}\n')
                 with open(CONFIG['used_sfz_file'], 'a', encoding='utf-8') as fh2:
                     fh2.write(f'{sfz_line}----{count}\n')
+                registered_accounts.append((username, password))
             with success_lock:
                 global success_counter
                 success_counter += 1
                 cur = success_counter
             log.info(f'[+] 注册成功 {username}----{password} (sfz {count}/{CONFIG["max_sfz_uses"]}) (总成功: {cur})')
-
-            if CONFIG['auto_login']:
-                try:
-                    sauth = do_login(username, password, proxies, CONFIG['headers'],
-                                     ocr_engine, CONFIG['use_custom_model'])
-                    if sauth:
-                        with file_lock:
-                            import json as _json
-                            with open(CONFIG['sauth_file'], 'a', encoding='utf-8') as sf:
-                                sf.write(_json.dumps({
-                                    'username': username, 'password': password,
-                                    'sauth': sauth
-                                }, ensure_ascii=False) + '\n')
-                        log.info(f'[+] 登录成功 {username} -> sauth 已保存')
-                    else:
-                        log.warning(f'[!] 登录失败 {username}')
-                except Exception as e:
-                    log.warning(f'[!] 登录异常 {username}: {e}')
-
             return 'success'
-        elif code == 'captcha_wrong':
-            continue
-        elif code in ('server_503', 'server_busy', 'rate_limit'):
-            proxy_manager.mark_bad(proxies)
-            return code
-        elif code:
-            proxy_manager.release(proxies)
-            return code
-        else:
-            proxy_manager.release(proxies)
-            return 'unknown'
 
-    proxy_manager.release(proxies)
-    return 'captcha_exhausted'
+        if not need_switch:
+            proxy_manager.release(proxies)
+            return result
+
+        # 需要换代理，继续循环
+        if proxy_try < max_proxy_tries - 1:
+            log.info(f'代理失败({result}), 换代理重试 {username} ({proxy_try+2}/{max_proxy_tries})')
+
+    return result
 
 
 def run_once(valid_sfz, used_count, proxy_manager):
@@ -475,6 +507,49 @@ def run_once(valid_sfz, used_count, proxy_manager):
         return 'error'
 
 
+def batch_login(proxy_manager, accounts):
+    """注册完成后批量登录获取sauth"""
+    if not accounts:
+        log.info('无账号需要登录')
+        return
+
+    log.info(f'=== 开始批量登录 ({len(accounts)} 个账号) ===')
+    import json as _json
+    login_ok = 0
+    login_fail = 0
+
+    for username, password in accounts:
+        proxies = proxy_manager.acquire()
+        if proxies is None or not proxies:
+            log.warning(f'登录 {username}: 无可用代理, 跳过')
+            login_fail += 1
+            continue
+        try:
+            sauth = do_login(username, password, proxies, CONFIG['headers'],
+                             ocr_engine, CONFIG['use_custom_model'])
+            if sauth:
+                with file_lock:
+                    with open(CONFIG['sauth_file'], 'a', encoding='utf-8') as sf:
+                        sf.write(_json.dumps({
+                            'username': username, 'password': password,
+                            'sauth': sauth
+                        }, ensure_ascii=False) + '\n')
+                proxy_manager.release(proxies, success=True)
+                login_ok += 1
+                log.info(f'[+] 登录成功 {username} ({login_ok}/{len(accounts)})')
+            else:
+                proxy_manager.release(proxies)
+                login_fail += 1
+                log.warning(f'[!] 登录失败 {username}')
+        except Exception as e:
+            proxy_manager.release(proxies)
+            login_fail += 1
+            log.warning(f'[!] 登录异常 {username}: {e}')
+        time.sleep(random.uniform(0.5, 1.5))
+
+    log.info(f'=== 批量登录完成: 成功 {login_ok}, 失败 {login_fail} ===')
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -485,6 +560,20 @@ if __name__ == "__main__":
     proxy_manager = ProxyManager()
     if CONFIG['use_proxy']:
         proxy_manager.load_proxies()
+        # 等待第一批代理验证完成
+        log.info('等待代理池就绪...')
+        for _ in range(60):
+            with proxy_manager._lock:
+                ready = len(proxy_manager._ready)
+                raw = len(proxy_manager._raw)
+            if ready >= 5 or raw == 0:
+                break
+            time.sleep(1)
+        with proxy_manager._lock:
+            ready = len(proxy_manager._ready)
+        log.info(f'代理池就绪: {ready} 个可用代理')
+        if ready == 0:
+            log.warning('警告: 没有可用代理, 注册可能会失败')
 
     used_count = {}
     for line in load_lines(CONFIG['used_sfz_file']):
@@ -536,4 +625,9 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             log.info('已停止')
 
-    log.info(f'本次运行结束, 总成功注册: {success_counter} 个')
+    log.info(f'注册阶段结束, 总成功注册: {success_counter} 个')
+
+    if CONFIG['auto_login'] and registered_accounts:
+        batch_login(proxy_manager, registered_accounts)
+
+    log.info(f'全部完成, 注册 {success_counter} 个, 登录 {len(registered_accounts)} 个')

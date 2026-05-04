@@ -80,7 +80,7 @@ base64 -w 0 sfz.txt
 | use_custom_model | 使用自定义验证码模型 | true |
 | auto_login | 注册后自动登录获取Sauth | true |
 | use_proxy | 使用代理IP | true |
-| proxy_list_urls | 代理列表地址(逗号分隔) | 4源合并 |
+| proxy_list_urls | 代理列表地址(逗号分隔) | 5源合并 |
 | max_per_ip | 单IP最大注册数(超限自动换IP) | 15 |
 | proxy_check_threads | 代理验证并发线程数 | 50 |
 | proxy_check_timeout | 代理验证超时(秒) | 5 |
@@ -160,7 +160,7 @@ USE_PROXY=true WORKERS=5 python auto_register_4399.py --count 20
 开启代理后（`use_proxy=true`），按以下优先级获取代理：
 
 1. **本地文件**：优先读取 `IP.txt`（每行 `ip:port`）
-2. **在线列表**：文件为空时自动从以下源批量拉取（去重合并），默认使用4个源：
+2. **在线列表**：自动从以下源批量拉取（去重合并），默认使用5个源：
 
 | 来源 | 更新频率 | HTTP列表 |
 |---|---|---|
@@ -168,6 +168,7 @@ USE_PROXY=true WORKERS=5 python auto_register_4399.py --count 20
 | [komutan234/Proxy-List-Free](https://github.com/komutan234/Proxy-List-Free) | 1分钟 | `proxies/http.txt` |
 | [proxifly/free-proxy-list](https://github.com/proxifly/free-proxy-list) | 5分钟 | `protocols/http/data.txt` |
 | [r00tee/Proxy-List](https://github.com/r00tee/Proxy-List) | 5分钟 | `Https.txt` |
+| [ABoredCat/Free-Proxy](https://github.com/ABoredCat/Free-Proxy) | - | `proxies/http.txt` |
 
 通过 `proxy_list_urls` 配置，逗号分隔多个地址，支持自定义添加任意源。
 
@@ -177,6 +178,7 @@ USE_PROXY=true WORKERS=5 python auto_register_4399.py --count 20
 - 每个代理IP最多注册 `max_per_ip`（默认15）个账号
 - 达到上限后自动归还并换下一个可用代理
 - 遇到封禁/超频错误**立即丢弃**该代理
+- 网络错误**软失败**：返回池中，连续失败10次才丢弃
 - 代理池耗尽后自动从在线列表拉取+验证新代理
 - 每轮结束后打印代理池状态（就绪/使用中/失效）
 - 不开代理时，直连IP同样受15次限制
@@ -222,7 +224,7 @@ username----password
 
 ## 验证码模型训练
 
-如需训练自己的验证码识别模型：
+如需训练自己的验证码识别模型，使用 `captcha_pipeline.py`：
 
 ```bash
 # 下载验证码图片
@@ -237,6 +239,15 @@ python captcha_pipeline.py train
 # 或一键全流程
 python captcha_pipeline.py all
 ```
+
+### 训练流程详解
+
+1. **collect（下载）**：自动从4399下载验证码图片，保存到 `captchas/` 目录
+2. **label（标注）**：使用OCR自动识别并生成标注，保存到 `captcha_labels.json`
+3. **train（训练）**：训练CNN模型，输出 `captcha_model.pth`
+4. **all（一键）**：按顺序执行以上三个步骤
+
+训练好的模型会自动用于注册和登录时的验证码识别。
 
 ## 赞助
 

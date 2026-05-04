@@ -58,7 +58,7 @@ on:
       proxy_list_urls:
         description: '代理列表地址(逗号分隔多个源)'
         required: false
-        default: 'https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt,https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/http.txt,https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt,https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt'
+        default: 'https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt,https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/http.txt,https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt,https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt,https://raw.githubusercontent.com/ABoredCat/Free-Proxy/main/proxies/http.txt'
       max_per_ip:
         description: '单IP最大注册数(超限自动换IP)'
         required: false
@@ -128,7 +128,7 @@ jobs:
           MIN_INTERVAL: ${{ github.event.inputs.min_interval || '1' }}
           MAX_INTERVAL: ${{ github.event.inputs.max_interval || '3' }}
           AUTO_LOGIN: ${{ github.event.inputs.auto_login || 'true' }}
-          PROXY_LIST_URLS: ${{ github.event.inputs.proxy_list_urls || 'https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt,https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/http.txt,https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt,https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt' }}
+          PROXY_LIST_URLS: ${{ github.event.inputs.proxy_list_urls || 'https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt,https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/http.txt,https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt,https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt,https://raw.githubusercontent.com/ABoredCat/Free-Proxy/main/proxies/http.txt' }}
           MAX_PER_IP: ${{ github.event.inputs.max_per_ip || '15' }}
           PROXY_CHECK_THREADS: ${{ github.event.inputs.proxy_check_threads || '50' }}
         run: |
