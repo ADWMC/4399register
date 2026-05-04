@@ -1,5 +1,7 @@
 # 4399全自动注册
 
+> 如果这个项目帮到了你，请点个 **Star** 支持一下！你的Star是我更新的动力。
+
 4399游戏平台批量自动注册工具，支持验证码自动识别、实名认证、并发注册、注册后自动登录获取Sauth凭证。可通过GitHub Actions云端运行。
 
 如果失效可以直接在issues里反馈。
@@ -77,10 +79,12 @@ base64 -w 0 sfz.txt
 | password_len | 密码长度 | 10 |
 | use_custom_model | 使用自定义验证码模型 | true |
 | auto_login | 注册后自动登录获取Sauth | true |
-| use_proxy | 使用代理IP | false |
-| proxy_api_protocol | 代理API协议 (http/https/socks4/socks5/all) | http |
-| proxy_api_count | 每次从API获取代理数量 (1-20) | 20 |
+| use_proxy | 使用代理IP | true |
+| proxy_list_urls | 代理列表地址(逗号分隔) | 4源合并 |
 | max_per_ip | 单IP最大注册数(超限自动换IP) | 15 |
+| proxy_check_threads | 代理验证并发线程数 | 50 |
+| proxy_check_timeout | 代理验证超时(秒) | 5 |
+| proxy_check_url | 代理验证地址 | httpbin.org/ip |
 | max_captcha_retry | 验证码最大重试次数 | 3 |
 | min_interval | 每轮最小间隔(秒) | 1 |
 | max_interval | 每轮最大间隔(秒) | 3 |
@@ -124,12 +128,13 @@ USE_PROXY=true WORKERS=5 python auto_register_4399.py --count 20
 
 | 环境变量 | 对应配置 |
 |---|---|
-| USE_PROXY | 是否使用代理 |
+| USE_PROXY | 是否使用代理 (默认开启) |
 | PROXY_FILE | 代理IP文件路径 |
-| PROXY_API_URL | 代理API地址 |
-| PROXY_API_PROTOCOL | 代理API协议类型 |
-| PROXY_API_COUNT | 每次从API获取代理数量 |
+| PROXY_LIST_URLS | 代理列表地址(逗号分隔多个源) |
 | MAX_PER_IP | 单IP最大注册数 |
+| PROXY_CHECK_THREADS | 代理验证并发线程数 |
+| PROXY_CHECK_TIMEOUT | 代理验证超时(秒) |
+| PROXY_CHECK_URL | 代理验证地址 |
 | USE_CUSTOM_MODEL | 是否使用自定义模型 |
 | CUSTOM_MODEL_FILE | 模型文件路径 |
 | MAX_CAPTCHA_RETRY | 验证码重试次数 |
@@ -155,15 +160,34 @@ USE_PROXY=true WORKERS=5 python auto_register_4399.py --count 20
 开启代理后（`use_proxy=true`），按以下优先级获取代理：
 
 1. **本地文件**：优先读取 `IP.txt`（每行 `ip:port`）
-2. **在线API**：文件为空时自动从 [proxy.scdn.io](https://proxy.scdn.io/api_docs.php) 获取免费代理
+2. **在线列表**：文件为空时自动从以下源批量拉取（去重合并），默认使用4个源：
+
+| 来源 | 更新频率 | HTTP列表 |
+|---|---|---|
+| [iplocate/free-proxy-list](https://github.com/iplocate/free-proxy-list) | 30分钟 | `protocols/http.txt` |
+| [komutan234/Proxy-List-Free](https://github.com/komutan234/Proxy-List-Free) | 1分钟 | `proxies/http.txt` |
+| [proxifly/free-proxy-list](https://github.com/proxifly/free-proxy-list) | 5分钟 | `protocols/http/data.txt` |
+| [r00tee/Proxy-List](https://github.com/r00tee/Proxy-List) | 5分钟 | `Https.txt` |
+
+通过 `proxy_list_urls` 配置，逗号分隔多个地址，支持自定义添加任意源。
 
 代理管理逻辑：
+- 拉取代理后**多线程并发验证**（默认50线程），只保留可用代理
+- 每个注册线程**独占一个代理IP**，不会多线程共用同一个IP
 - 每个代理IP最多注册 `max_per_ip`（默认15）个账号
-- 达到上限后**自动切换**下一个代理
-- 遇到封禁/超频错误**立即丢弃**当前代理
-- 代理池耗尽后**自动从API拉取**新代理
-- 每轮结束后打印代理池状态（总数/可用/失效）
+- 达到上限后自动归还并换下一个可用代理
+- 遇到封禁/超频错误**立即丢弃**该代理
+- 代理池耗尽后自动从在线列表拉取+验证新代理
+- 每轮结束后打印代理池状态（就绪/使用中/失效）
 - 不开代理时，直连IP同样受15次限制
+
+相关配置：
+
+| 参数 | 说明 | 默认值 |
+|---|---|---|
+| proxy_check_threads | 代理验证并发线程数 | 50 |
+| proxy_check_timeout | 代理验证超时(秒) | 5 |
+| proxy_check_url | 代理验证地址 | httpbin.org/ip |
 
 ## 数据文件格式
 

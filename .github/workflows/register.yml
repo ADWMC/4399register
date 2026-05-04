@@ -38,7 +38,7 @@ on:
       use_proxy:
         description: '使用代理 (true/false)'
         required: false
-        default: 'false'
+        default: 'true'
       max_captcha_retry:
         description: '验证码最大重试次数'
         required: false
@@ -55,22 +55,18 @@ on:
         description: '注册后自动登录获取sauth (true/false)'
         required: false
         default: 'true'
-      proxy_api_url:
-        description: '代理API地址'
+      proxy_list_urls:
+        description: '代理列表地址(逗号分隔多个源)'
         required: false
-        default: 'https://proxy.scdn.io/api/get_proxy.php'
-      proxy_api_protocol:
-        description: '代理API协议 (http/https/socks4/socks5/all)'
-        required: false
-        default: 'http'
-      proxy_api_count:
-        description: '每次从API获取代理数量 (1-20)'
-        required: false
-        default: '20'
+        default: 'https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt,https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/http.txt,https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt,https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt'
       max_per_ip:
         description: '单IP最大注册数(超限自动换IP)'
         required: false
         default: '15'
+      proxy_check_threads:
+        description: '代理验证并发线程数'
+        required: false
+        default: '50'
 
   schedule:
     - cron: '0 */6 * * *'
@@ -127,15 +123,14 @@ jobs:
           USERNAME_LEN: ${{ github.event.inputs.username_len || '7' }}
           PASSWORD_LEN: ${{ github.event.inputs.password_len || '10' }}
           USE_CUSTOM_MODEL: ${{ github.event.inputs.use_custom_model || 'true' }}
-          USE_PROXY: ${{ github.event.inputs.use_proxy || 'false' }}
+          USE_PROXY: ${{ github.event.inputs.use_proxy || 'true' }}
           MAX_CAPTCHA_RETRY: ${{ github.event.inputs.max_captcha_retry || '3' }}
           MIN_INTERVAL: ${{ github.event.inputs.min_interval || '1' }}
           MAX_INTERVAL: ${{ github.event.inputs.max_interval || '3' }}
           AUTO_LOGIN: ${{ github.event.inputs.auto_login || 'true' }}
-          PROXY_API_URL: ${{ github.event.inputs.proxy_api_url || 'https://proxy.scdn.io/api/get_proxy.php' }}
-          PROXY_API_PROTOCOL: ${{ github.event.inputs.proxy_api_protocol || 'http' }}
-          PROXY_API_COUNT: ${{ github.event.inputs.proxy_api_count || '20' }}
+          PROXY_LIST_URLS: ${{ github.event.inputs.proxy_list_urls || 'https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt,https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/http.txt,https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt,https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt' }}
           MAX_PER_IP: ${{ github.event.inputs.max_per_ip || '15' }}
+          PROXY_CHECK_THREADS: ${{ github.event.inputs.proxy_check_threads || '50' }}
         run: |
           COUNT="${{ github.event.inputs.count || '0' }}"
           DURATION="${{ github.event.inputs.duration || '3600' }}"
