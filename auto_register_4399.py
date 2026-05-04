@@ -1,157 +1,346 @@
 import time
-import traceback
-
+import logging
 import requests
 import random
-import linecache
-import re
 import ddddocr
+import urllib3
+import threading
+from io import BytesIO
+from PIL import Image
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ==================== 配置 ====================
+CONFIG = {
+    # 代理
+    'use_proxy': False,
+    'proxy_file': 'IP.txt',
+
+    # 验证码识别
+    'use_custom_model': True,  # True=用训练的模型, False=用ddddocr
+    'custom_model_file': 'captcha_model.pth',
+
+    # 注册
+    'max_captcha_retry': 3,
+    'max_sfz_uses': 4,
+    'captcha_length': 4,
+    'username_prefix': '',   # 用户名前缀，如 'usr_'；留空则纯随机
+    'username_len': 7,       # 用户名总长度（含前缀）
+    'password_len': 10,
+
+    # 请求
+    'captcha_url': 'https://ptlogin.4399.com/ptlogin/captcha.do?captchaId={}',
+    'register_url': 'https://ptlogin.4399.com/ptlogin/register.do',
+    'headers': {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://ptlogin.4399.com/',
+    },
+
+    # 文件
+    'sfz_file': 'sfz.txt',
+    'used_sfz_file': 'used_sfz.txt',
+    'output_file': '4399.txt',
+    'log_file': 'register.log',
+
+    # 并发
+    'workers': 3,           # 并发线程数（别太大，容易被封）
+    'min_interval': 1,
+    'max_interval': 3,
+}
+
+ALPHABET = 'abcdefghijklmnopqrstuvwxyz1234567890'
+
+ERROR_MAP = {
+    '注册成功':     'success',
+    '验证码错误':   'captcha_wrong',
+    '请稍后再试':   'rate_limit',
+    '身份证实名帐号数量超过限制': 'sfz_limit',
+    '身份证实名过于频繁':       'sfz_freq',
+    '该姓名身份证提交验证过于频繁': 'sfz_name_freq',
+    '用户名已被注册': 'username_taken',
+    'HTTP ERROR 500': 'server_500',
+    '503 Service Temporarily Unavailable': 'server_503',
+    '服务器繁忙':   'server_busy',
+}
+
+# ==================== 初始化 ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler(CONFIG['log_file'], encoding='utf-8'),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger(__name__)
+
+if CONFIG['use_custom_model']:
+    from captcha_pipeline import CaptchaRecognizer
+    ocr_engine = CaptchaRecognizer(CONFIG['custom_model_file'])
+    log.info(f'使用自定义模型: {CONFIG["custom_model_file"]}')
+else:
+    ocr_engine = ddddocr.DdddOcr(show_ad=False)
+    log.info('使用 ddddocr')
 
 
-class gethttpproxies:
+def load_lines(file):
+    for enc in ('utf-8', 'gbk', 'gb2312', 'latin-1'):
+        try:
+            with open(file, 'r', encoding=enc) as f:
+                return [line.strip() for line in f if line.strip()]
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+        except FileNotFoundError:
+            return []
+    return []
+
+
+def parse_sfz(line):
+    parts = line.split('----')
+    if len(parts) == 2 and len(parts[0]) in [2, 3] and len(parts[1]) == 18:
+        return parts[0], parts[1]
+    return None, None
+
+
+class ProxyManager:
     def __init__(self):
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 13_3_1 like Mac OS X; zh-CN) AppleWebKit/537.51.1 ('
-                          'KHTML, like Gecko) Mobile/17D50 UCBrowser/12.8.2.1268 Mobile AliApp(TUnionSDK/0.1.20.3) '
-        }
+        self._lock = threading.Lock()
+        self.current_proxy = None
+        self.proxies = []
 
-    def main(self):
-        for i in range(5):
-            html = requests.get('https://ip.jiangxianli.com/?page={}&country=%E4%B8%AD%E5%9B%BD'.format(i),
-                                verify=False).text
-            list_ip = re.findall('<td>(.*?)</td>', html)  # 匹配所有IP,端口,地区延迟之类的
-            for j in range(len(list_ip)):
-                if re.match(
-                        '^([1-9]|([1-9][0-9])|(1[0-9][0-9])|(2[0-4][0-9])|(25[0-5]))(\.([0-9]|([1-9][0-9])|(1[0-9][0-9])|(2[0-4][0-9])|(25[0-5]))){3}$',
-                        list_ip[j]):  # 匹配是不是IP
-                    print("获取代理IP " + list_ip[j] + ':' + list_ip[j + 1])
-                    fh = open("IP.txt", "a+")
-                    fh.write(list_ip[j] + ':' + list_ip[j + 1] + '\n')
-                    fh.close()
+    def load_proxies(self):
+        self.proxies = load_lines(CONFIG['proxy_file'])
 
+    def get_proxy(self):
+        with self._lock:
+            if not CONFIG['use_proxy'] or not self.proxies:
+                return {}
+            if self.current_proxy is None:
+                self.current_proxy = random.choice(self.proxies)
+                log.info(f'切换代理: {self.current_proxy}')
+            return {'http': f'http://{self.current_proxy}', 'https': f'http://{self.current_proxy}'}
 
-def random_ip(file):  # 在一个文本中取随机一行
-    txt = open(file, 'rb')
-    data = txt.read().decode('utf-8')
-    txt.close()
-    n = data.count('\n')
-    i = random.randint(1, (n + 1))
-    line = linecache.getline(file, i)
-    return line.replace('\n', '')
+    def add_fail(self):
+        with self._lock:
+            self.current_proxy = None
 
 
-def MCQTSS_qzjwb(text, start_str, end):  # 取出字符串中间文本
-    start = text.find(start_str)
-    if start >= 0:
-        start += len(start_str)
-        end = text.find(end, start)
-        if end >= 0:
-            return text[start:end].strip()
+def _upscale(img_bytes, scale=3):
+    img = Image.open(BytesIO(img_bytes))
+    w, h = img.size
+    img = img.resize((w * scale, h * scale), Image.LANCZOS)
+    buf = BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue()
 
 
-def register_4399(username, password, yzm_4399=False):  # 4399注册
+def _clean_result(raw):
+    return ''.join(c for c in raw if c.isalnum())
+
+
+def recognize_captcha(img_bytes):
+    if not img_bytes or len(img_bytes) < 100:
+        return None
+
+    if CONFIG['use_custom_model']:
+        try:
+            result = ocr_engine.recognize(img_bytes)
+            if len(result) == CONFIG['captcha_length']:
+                return result
+        except Exception:
+            pass
+        return None
+
     try:
-        while True:
-            sfz = random_ip('sfz.txt')  # 随机身份证
-            if len(sfz.split('----')[1]) == 18 and len(sfz.split('----')[0]) in [2, 3]:
-                break
-            else:
-                print('身份证:{}异常'.format(sfz))
-        sessionId = 'captchaReq' + ''.join(random.sample(alphabet, 19))  # 获取一个随机的sessionId
-        proxies = {
-            'http': 'http://' + random_ip("IP.txt")
-        }  # 获取一个随机代理,如果你注册的很慢可以检查一下自己代理的质量
-        if proxies['http'] == 'http://':
-            proxies = {}
-        print("代理:{}".format(proxies))
-        if yzm_4399 is True:  # 判断是否需要验证码
-            # 如果需要本地识别(容易炸内存,发起3k个线程32g直接跑满)
-            ocr = ddddocr.DdddOcr(use_gpu=True, device_id=0, show_ad=False)
-            yzm_data = ocr.classification(
-                requests.get(url='https://ptlogin.4399.com/ptlogin/captcha.do?captchaId={}'.format(sessionId),
-                             headers=IP.headers, proxies=proxies).content)  # 获取sessionId对应的验证码图片
-            if len(yzm_data) < 4:
-                yzm_data = yzm_data + ''.join(random.sample(alphabet, 4 - len(yzm_data)))
+        strategies = [
+            ('raw', img_bytes),
+            ('upscaled', _upscale(img_bytes)),
+        ]
+    except Exception:
+        return None
+    for name, data in strategies:
+        try:
+            raw = ocr_engine.classification(data)
+        except Exception:
+            continue
+        result = _clean_result(raw)
+        if len(result) == CONFIG['captcha_length']:
+            return result
+    return None
+
+
+def match_error(html):
+    for keyword, code in ERROR_MAP.items():
+        if keyword in html:
+            return code
+    return None
+
+
+def parse_tip(html):
+    marker = '<div id="Msg" class="login_hor login_err_tip">'
+    start = html.find(marker)
+    if start >= 0:
+        start += len(marker)
+        end = html.find('</div>', start)
+        if end >= 0:
+            return html[start:end].strip()
+    return None
+
+
+def load_valid_sfz():
+    all_lines = load_lines(CONFIG['sfz_file'])
+    result = []
+    for line in all_lines:
+        name, idcard = parse_sfz(line)
+        if name:
+            result.append((line, name, idcard))
+    return result
+
+
+def pick_sfz(valid_sfz, used_count):
+    candidates = [item for item in valid_sfz if used_count.get(item[0], 0) < CONFIG['max_sfz_uses']]
+    if not candidates:
+        return None, None, None
+    return random.choice(candidates)
+
+
+file_lock = threading.Lock()
+
+
+def register_4399(username, password, valid_sfz, used_count, proxy_manager, session=None):
+    proxies = proxy_manager.get_proxy()
+    req = session or requests
+
+    with file_lock:
+        sfz_line, realname, idcard = pick_sfz(valid_sfz, used_count)
+    if not sfz_line:
+        return 'no_sfz'
+
+    for attempt in range(CONFIG['max_captcha_retry'] + 1):
+        sessionId = 'captchaReq' + ''.join(random.sample(ALPHABET, 19))
+        try:
+            captcha_img = req.get(
+                url=CONFIG['captcha_url'].format(sessionId),
+                headers=CONFIG['headers'], proxies=proxies, timeout=10).content
+        except (requests.exceptions.ProxyError,
+                requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout):
+            proxy_manager.add_fail()
+            return 'net_error'
+        yzm_data = recognize_captcha(captcha_img)
+        if yzm_data is None:
+            continue
+
+        post = {
+            'postLoginHandler': 'default', 'displayMode': 'popup',
+            'appId': 'www_home', 'gameId': '', 'cid': '', 'externalLogin': 'qq',
+            'aid': '', 'ref': '', 'css': '', 'redirectUrl': '',
+            'regMode': 'reg_normal', 'sessionId': sessionId,
+            'regIdcard': 'true', 'noEmail': 'false',
+            'crossDomainIFrame': '', 'crossDomainUrl': '',
+            'mainDivId': 'popup_reg_div', 'showRegInfo': 'true',
+            'includeFcmInfo': 'false', 'expandFcmInput': 'false',
+            'fcmFakeValidate': 'true',
+            'username': username, 'password': password, 'passwordveri': password,
+            'email': f'ADWMC_{"".join(random.sample(ALPHABET, 5))}@qq.com',
+            'inputCaptcha': yzm_data, 'reg_eula_agree': 'on',
+            'realname': realname, 'idcard': idcard,
+        }
+        try:
+            html = req.post(url=CONFIG['register_url'], data=post,
+                            proxies=proxies, timeout=15, headers=CONFIG['headers']).text
+        except (requests.exceptions.ProxyError,
+                requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout):
+            proxy_manager.add_fail()
+            return 'net_error'
+
+        code = match_error(html)
+        if code == 'success':
+            with file_lock:
+                count = used_count.get(sfz_line, 0) + 1
+                used_count[sfz_line] = count
+                with open(CONFIG['output_file'], 'a', encoding='utf-8') as fh:
+                    fh.write(f'{username}----{password}\n')
+                with open(CONFIG['used_sfz_file'], 'a', encoding='utf-8') as fh2:
+                    fh2.write(f'{sfz_line}----{count}\n')
+            log.info(f'[+] 注册成功 {username}----{password} (sfz {count}/{CONFIG["max_sfz_uses"]})')
+            return 'success'
+        elif code == 'captcha_wrong':
+            continue
+        elif code in ('server_503', 'server_busy', 'rate_limit'):
+            proxy_manager.add_fail()
+            return code
+        elif code:
+            return code
         else:
-            # 如果不需要验证码识别直接给4个随机数
-            yzm_data = ''.join(random.sample(alphabet, 4))
-        post = {'postLoginHandler': 'default',
-                'displayMode': 'popup',
-                'appId': 'www_home',
-                'gameId': '',
-                'cid': '',
-                'externalLogin': 'qq',
-                'aid': '',
-                'ref': '',
-                'css': '',
-                'redirectUrl': '',
-                'regMode': 'reg_normal',
-                'sessionId': sessionId,  # 上面给的验证码ID部分
-                'regIdcard': 'true',
-                'noEmail': 'false',
-                'crossDomainIFrame': '',
-                'crossDomainUrl': '',
-                'mainDivId': 'popup_reg_div',
-                'showRegInfo': 'true',
-                'includeFcmInfo': 'false',
-                'expandFcmInput': 'false',
-                'fcmFakeValidate': 'true',
-                'username': username,
-                'password': password,
-                'passwordveri': password,
-                'email': '{}@qq.com'.format('mcqtss' + ''.join(random.sample(alphabet, 5))),  # 邮箱,可以随便写
-                'inputCaptcha': yzm_data,  # 验证码填写处
-                'reg_eula_agree': 'on',
-                'realname': sfz.split('----')[0],  # 身份证姓名
-                'idcard': sfz.split('----')[1]}  # 身份证号码
-        html = requests.post(url='https://ptlogin.4399.com/ptlogin/register.do',
-                             data=post,
-                             proxies=proxies,
-                             timeout=5,
-                             headers=IP.headers).text
-        # print(MCQTSS_qzjwb(html, '<div id="Msg" class="login_hor login_err_tip">', '</div>'))
-        # 去掉上面这行注释打印全部错误信息
-        if html.find('身份证实名帐号数量超过限制') != -1:
-            print('身份证实名帐号数量超过限制')
-            return '身份证实名帐号数量超过限制'
-        elif html.find('身份证实名过于频繁') != -1:
-            print('身份证实名过于频繁')
-            return '身份证实名过于频繁'
-        elif html.find('该姓名身份证提交验证过于频繁') != -1:
-            print('该姓名身份证提交验证过于频繁')
-            return '该姓名身份证提交验证过于频繁'
-        elif html.find('验证码错误') != -1:
-            register_4399(username, password, True)
-            return '验证码错误'
-        elif html.find('用户名已被注册') != -1:
-            print('用户名已被注册')
-            return '用户名已被注册'
-        elif html.find('HTTP ERROR 500') != -1:
-            print('HTTP ERROR 500')
-            return 'HTTP ERROR 500'
-        elif html.find('注册成功') != -1:
-            print('注册成功 {}----{}'.format(username, password))
-            fh = open('4399.txt', 'a+')
-            fh.write('{}----{}\n'.format(username, password))
-            fh.close()
-            print("身份证:{}".format(sfz))
-            return '注册成功 {}----{}'.format(username, password)
-        elif html.find("503 Service Temporarily Unavailable") != -1:
-            print('503 Service Temporarily Unavailable')
-        else:
-            print(html)
-            return html
-    except:
-        traceback.print_exc()
-        return 'Error'
+            return 'unknown'
+
+    return 'captcha_exhausted'
+
+
+def run_once(valid_sfz, used_count, proxy_manager):
+    prefix = CONFIG['username_prefix']
+    rand_len = CONFIG['username_len'] - len(prefix)
+    username = prefix + ''.join(random.sample(ALPHABET, rand_len))
+    password = ''.join(random.sample(ALPHABET, CONFIG['password_len']))
+    session = requests.Session()
+    session.headers.update(CONFIG['headers'])
+    if CONFIG['use_proxy']:
+        session.verify = False
+    try:
+        return register_4399(username, password, valid_sfz, used_count, proxy_manager, session)
+    except Exception as e:
+        log.error(f'异常: {e.__class__.__name__}: {e}')
+        return 'error'
 
 
 if __name__ == "__main__":
-    alphabet = 'abcdefghijklmnopqrstuvwxyz1234567890'  # 随机字符串包含的字符
-    yzm = False
-    IP = gethttpproxies()
-    IP.main()
-    # 如果有代理IP去掉这个注释
-    while True:
-        register_4399(''.join(random.sample(alphabet, 7)), ''.join(random.sample(alphabet, 10)))
-        time.sleep(0.5)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--duration', type=int, default=0, help='运行时长(秒), 0=无限')
+    args = parser.parse_args()
+
+    proxy_manager = ProxyManager()
+    if CONFIG['use_proxy']:
+        proxy_manager.load_proxies()
+
+    used_count = {}
+    for line in load_lines(CONFIG['used_sfz_file']):
+        parts = line.rsplit('----', 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            sfz_key = parts[0]
+            used_count[sfz_key] = max(used_count.get(sfz_key, 0), int(parts[1]))
+        else:
+            used_count[line] = CONFIG['max_sfz_uses']
+    valid_sfz = load_valid_sfz()
+    available = sum(1 for item in valid_sfz if used_count.get(item[0], 0) < CONFIG['max_sfz_uses'])
+    log.info(f'已加载 {len(valid_sfz)} 条有效身份证, 可用 {available} 条, 并发 {CONFIG["workers"]} 线程')
+
+    deadline = time.time() + args.duration if args.duration > 0 else None
+
+    with ThreadPoolExecutor(max_workers=CONFIG['workers']) as pool:
+        try:
+            while True:
+                if deadline and time.time() >= deadline:
+                    log.info(f'已达到运行时长 {args.duration} 秒, 停止')
+                    break
+
+                futures = []
+                for _ in range(CONFIG['workers']):
+                    f = pool.submit(run_once, valid_sfz, used_count, proxy_manager)
+                    futures.append(f)
+                    time.sleep(random.uniform(0.2, 0.5))
+
+                for f in as_completed(futures):
+                    result = f.result()
+                    if result not in ('success',):
+                        log.info(f'结果: {result}')
+
+                time.sleep(random.uniform(CONFIG['min_interval'], CONFIG['max_interval']))
+        except KeyboardInterrupt:
+            log.info('已停止')
