@@ -155,10 +155,18 @@ class ProxyManager:
         self._usage = {}          # {proxy: 累计注册成功次数}
         self._fail_count = {}     # {proxy: 连续失败次数}
         self._direct_count = 0    # 直连IP计数
-        self._raw = []            # 待验证的原始代理
+        self._raw = []            # 待验证的原始代理（仅用于去重）
+        self._raw_q = Queue()     # 待验证队列（快速出队）
         self._check_threads = CONFIG['proxy_check_threads']
-        self._stop_event = threading.Event()
+        self._check_pool = ThreadPoolExecutor(max_workers=self._check_threads)
         self._refilling = False
+        self._checked = 0         # 已验证总数（用于进度日志）
+
+    def _submit_raw(self, proxies):
+        """批量提交代理到验证队列并调度验证任务"""
+        for p in proxies:
+            self._raw_q.put(p)
+            self._check_pool.submit(self._check_one_and_store)
 
     def load_proxies(self):
         file_proxies = load_lines(CONFIG['proxy_file'])
@@ -167,11 +175,16 @@ class ProxyManager:
             log.info(f'从文件加载 {len(file_proxies)} 个代理')
         self.fetch_from_list()
         self.fetch_from_scrapers()
-        self._start_checkers()
+        if self._raw:
+            log.info(f'开始验证 {len(self._raw)} 个代理 ({self._check_threads} 并发)')
+            self._submit_raw(self._raw)
+
+    def _known_set(self):
+        return set(self._raw) | set(self._ready) | self._bad | set(self._in_use.keys())
 
     def fetch_from_list(self):
         urls = [u.strip() for u in CONFIG['proxy_list_urls'].split(',') if u.strip()]
-        existing = set(self._raw) | set(self._ready) | self._bad | set(self._in_use.keys())
+        existing = self._known_set()
         total_added = 0
         for url in urls:
             try:
@@ -187,11 +200,11 @@ class ProxyManager:
                     log.warning(f'  x {url.split("/")[-1]}: HTTP {resp.status_code}')
             except Exception as e:
                 log.warning(f'  x {url.split("/")[-1]}: {e}')
-        log.info(f'本次拉取 {total_added} 个代理, 待验证队列 {len(self._raw)} 个')
+        log.info(f'本次拉取 {total_added} 个代理, 累计 {len(self._raw)} 个')
 
     def fetch_from_scrapers(self):
         """从需要解析HTML的代理站抓取"""
-        existing = set(self._raw) | set(self._ready) | self._bad | set(self._in_use.keys())
+        existing = self._known_set()
         total_added = 0
         ip_port_re = re.compile(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})[^\d](\d{2,5})')
 
@@ -230,36 +243,21 @@ class ProxyManager:
         except Exception:
             return False
 
-    def _checker_worker(self):
-        """后台验证线程：持续从 _raw 取代理验证，放入 _ready 或 _bad"""
-        checked_count = 0
-        while not self._stop_event.is_set():
-            proxy = None
-            with self._lock:
-                if self._raw:
-                    proxy = self._raw.pop(0)
-            if proxy is None:
-                time.sleep(0.5)
-                continue
-            ok = self._check_one(proxy)
-            with self._lock:
-                if ok and proxy not in self._bad and proxy not in self._ready and proxy not in self._in_use:
-                    self._ready.append(proxy)
-                else:
-                    self._bad.add(proxy)
-                checked_count += 1
-                if checked_count % 50 == 0:
-                    log.info(f'验证进度: 已检查 {checked_count}, 就绪 {len(self._ready)}, 失效 {len(self._bad)}')
-
-    def _start_checkers(self):
-        """启动后台验证线程（守护线程，边验证边注册）"""
-        if not self._raw:
+    def _check_one_and_store(self):
+        """从队列取一个代理验证，结果存入对应池"""
+        try:
+            proxy = self._raw_q.get_nowait()
+        except Exception:
             return
-        n = min(self._check_threads, len(self._raw))
-        log.info(f'启动 {n} 个后台验证线程, {len(self._raw)} 个代理待验证 (边验证边注册)')
-        for _ in range(n):
-            t = threading.Thread(target=self._checker_worker, daemon=True)
-            t.start()
+        ok = self._check_one(proxy)
+        with self._lock:
+            if ok and proxy not in self._bad and proxy not in self._ready and proxy not in self._in_use:
+                self._ready.append(proxy)
+            else:
+                self._bad.add(proxy)
+            self._checked += 1
+            if self._checked % 200 == 0:
+                log.info(f'验证进度: {self._checked}, 就绪 {len(self._ready)}, 失效 {len(self._bad)}')
 
     def _refill(self):
         """补充代理池（带锁防并发重复填充）"""
@@ -270,13 +268,22 @@ class ProxyManager:
         try:
             before = len(self._raw)
             self.fetch_from_list()
-            added = len(self._raw) - before
-            if added > 0:
-                n = min(self._check_threads, added)
-                log.info(f'补充启动 {n} 个验证线程')
-                for _ in range(n):
-                    t = threading.Thread(target=self._checker_worker, daemon=True)
-                    t.start()
+            self.fetch_from_scrapers()
+            added = self._raw[before:]
+            if added:
+                log.info(f'补充提交 {len(added)} 个代理验证')
+                self._submit_raw(added)
+                return
+
+            # 在线源没拉到新代理，把失效代理全部重验
+            with self._lock:
+                if not self._bad:
+                    return
+                recycled = list(self._bad)
+                self._bad.clear()
+                self._raw.extend(recycled)
+            log.info(f'无新代理来源, 重验 {len(recycled)} 个失效代理')
+            self._submit_raw(recycled)
         finally:
             with self._lock:
                 self._refilling = False
@@ -309,7 +316,7 @@ class ProxyManager:
                     log.info(f'所有就绪代理已达上限, 已重置 {len(self._ready)} 个代理的使用计数')
                     continue  # 立即重试，不等待
 
-                raw_left = len(self._raw)
+                raw_left = self._raw_q.qsize()
                 ready_cnt = len(self._ready)
                 bad_cnt = len(self._bad)
             # 每5秒打印一次等待状态
@@ -374,7 +381,7 @@ class ProxyManager:
             ready = len(self._ready)
             busy = len(self._in_use)
             bad = len(self._bad)
-            raw = len(self._raw)
+            raw = self._raw_q.qsize()
             return f'代理池: 就绪{ready} 使用中{busy} 待验证{raw} 失效{bad}'
 
 
@@ -630,8 +637,8 @@ if __name__ == "__main__":
         for i in range(120):
             with proxy_manager._lock:
                 ready = len(proxy_manager._ready)
-                raw = len(proxy_manager._raw)
                 bad = len(proxy_manager._bad)
+            raw = proxy_manager._raw_q.qsize()
             if ready >= warmup or raw == 0:
                 break
             if i % 10 == 0 and i > 0:
@@ -660,6 +667,8 @@ if __name__ == "__main__":
         log.info(f'限时: {args.duration} 秒')
 
     deadline = time.time() + args.duration if args.duration > 0 else None
+    last_success_time = time.time()
+    last_activity_time = time.time()  # 最近一次有代理可用的时间
 
     with ThreadPoolExecutor(max_workers=CONFIG['workers']) as pool:
         pending = set()
@@ -671,6 +680,9 @@ if __name__ == "__main__":
                 if args.count > 0 and success_counter >= args.count:
                     log.info(f'已达到目标数量 {args.count} 个, 停止')
                     break
+                if time.time() - last_success_time > 30 and time.time() - last_activity_time > 30:
+                    log.warning('30秒无代理可用且无注册成功, 停止运行')
+                    break
 
                 # 持续填满线程池，不等待整批完成
                 while len(pending) < CONFIG['workers']:
@@ -680,11 +692,17 @@ if __name__ == "__main__":
                 done, pending = wait(pending, return_when=FIRST_COMPLETED)
                 for f in done:
                     result = f.result()
+                    if result == 'success':
+                        last_success_time = time.time()
+                        last_activity_time = time.time()
+                    elif result == 'no_proxy':
+                        pass  # 不更新 activity 时间
+                    else:
+                        last_activity_time = time.time()
+                        log.info(f'结果: {result}')
                     if result == 'ip_limit':
                         log.warning('所有IP已达注册上限, 停止运行')
                         raise SystemExit
-                    if result not in ('success',):
-                        log.info(f'结果: {result}')
 
                 if CONFIG['use_proxy'] and len(pending) % CONFIG['workers'] == 0:
                     log.info(proxy_manager.stats())
